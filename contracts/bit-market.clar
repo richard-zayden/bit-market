@@ -171,3 +171,180 @@
     )
   )
 )
+
+;; COMPETITIVE AUCTION SYSTEM
+
+;; Initialize auction for product
+(define-public (initialize-auction
+    (title (string-ascii 128))
+    (details (string-ascii 512))
+    (reserve-price uint)
+    (auction-duration uint)
+  )
+  (let (
+      (merchant-profile (unwrap! (map-get? MerchantRegistry tx-sender) ERR_MERCHANT_NOT_REGISTERED))
+      (new-product-id (+ (var-get global-product-counter) u1))
+      (auction-end-height (+ stacks-block-height auction-duration))
+    )
+    (asserts! (>= auction-duration u10) ERR_INVALID_TIME_DURATION)
+    (asserts! (> reserve-price u0) ERR_INVALID_PRICE_POINT)
+
+    (begin
+      (var-set global-product-counter new-product-id)
+      ;; Create product listing
+      (map-set ProductCatalog new-product-id {
+        merchant: tx-sender,
+        title: title,
+        details: details,
+        price-point: reserve-price,
+        is-available: true,
+        listing-height: stacks-block-height,
+        auction-mode: true,
+      })
+      ;; Initialize auction parameters
+      (map-set AuctionEngine new-product-id {
+        expiration-height: auction-end-height,
+        reserve-price: reserve-price,
+        leading-bid: u0,
+        leading-bidder: none,
+        auction-active: true,
+      })
+      (ok new-product-id)
+    )
+  )
+)
+
+;; Submit competitive bid
+(define-public (submit-bid
+    (product-id uint)
+    (bid-amount uint)
+  )
+  (let (
+      (product-data (unwrap! (map-get? ProductCatalog product-id) ERR_PRODUCT_NOT_FOUND))
+      (auction-data (unwrap! (map-get? AuctionEngine product-id) ERR_NO_ACTIVE_BIDDING))
+    )
+    (asserts! (get auction-active auction-data) ERR_AUCTION_EXPIRED)
+    (asserts! (<= stacks-block-height (get expiration-height auction-data))
+      ERR_AUCTION_EXPIRED
+    )
+    (asserts! (>= bid-amount (get reserve-price auction-data))
+      ERR_BID_BELOW_THRESHOLD
+    )
+    (asserts! (> bid-amount (get leading-bid auction-data))
+      ERR_BID_BELOW_THRESHOLD
+    )
+    (asserts! (>= (stx-get-balance tx-sender) bid-amount)
+      ERR_INSUFFICIENT_BALANCE
+    )
+
+    ;; Refund previous leading bidder
+    (match (get leading-bidder auction-data)
+      previous-bidder (try! (stx-transfer? (get leading-bid auction-data) CONTRACT_OWNER
+        previous-bidder
+      ))
+      true
+    )
+
+    ;; Accept new leading bid
+    (try! (stx-transfer? bid-amount tx-sender CONTRACT_OWNER))
+    (map-set AuctionEngine product-id
+      (merge auction-data {
+        leading-bid: bid-amount,
+        leading-bidder: (some tx-sender),
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Finalize auction settlement
+(define-public (finalize-auction (product-id uint))
+  (let (
+      (product-data (unwrap! (map-get? ProductCatalog product-id) ERR_PRODUCT_NOT_FOUND))
+      (auction-data (unwrap! (map-get? AuctionEngine product-id) ERR_NO_ACTIVE_BIDDING))
+      (merchant-address (get merchant product-data))
+    )
+    (asserts! (get auction-active auction-data) ERR_AUCTION_EXPIRED)
+    (asserts! (>= stacks-block-height (get expiration-height auction-data))
+      ERR_AUCTION_EXPIRED
+    )
+
+    (match (get leading-bidder auction-data)
+      auction-winner (begin
+        (let (
+            (final-bid (get leading-bid auction-data))
+            (protocol-fee (/ (* final-bid (var-get protocol-fee-basis-points)) u10000))
+          )
+          ;; Transfer payment to merchant (minus protocol fee)
+          (try! (stx-transfer? (- final-bid protocol-fee) CONTRACT_OWNER
+            merchant-address
+          ))
+          ;; Update product availability
+          (map-set ProductCatalog product-id
+            (merge product-data { is-available: false })
+          )
+          ;; Close auction
+          (map-set AuctionEngine product-id
+            (merge auction-data { auction-active: false })
+          )
+          (ok auction-winner)
+        )
+      )
+      ERR_NO_ACTIVE_BIDDING
+    )
+  )
+)
+
+;; QUALITY ASSURANCE & REVIEWS
+
+;; Submit product review and rating
+(define-public (submit-product-review
+    (product-id uint)
+    (quality-score uint)
+    (feedback-text (string-ascii 256))
+  )
+  (let ((product-data (unwrap! (map-get? ProductCatalog product-id) ERR_PRODUCT_NOT_FOUND)))
+    (asserts! (<= quality-score u5) ERR_RATING_OUT_OF_BOUNDS)
+    (map-set QualityAssurance {
+      item-id: product-id,
+      reviewer: tx-sender,
+    } {
+      quality-score: quality-score,
+      feedback-text: feedback-text,
+      review-height: stacks-block-height,
+    })
+    (ok true)
+  )
+)
+
+;; READ-ONLY QUERY FUNCTIONS
+
+(define-read-only (get-product-details (product-id uint))
+  (ok (map-get? ProductCatalog product-id))
+)
+
+(define-read-only (get-merchant-profile (merchant principal))
+  (ok (map-get? MerchantRegistry merchant))
+)
+
+(define-read-only (get-product-review
+    (product-id uint)
+    (reviewer principal)
+  )
+  (ok (map-get? QualityAssurance {
+    item-id: product-id,
+    reviewer: reviewer,
+  }))
+)
+
+(define-read-only (get-auction-status (product-id uint))
+  (ok (map-get? AuctionEngine product-id))
+)
+
+(define-read-only (get-current-product-count)
+  (ok (var-get global-product-counter))
+)
+
+(define-read-only (get-protocol-fee-rate)
+  (ok (var-get protocol-fee-basis-points))
+)
